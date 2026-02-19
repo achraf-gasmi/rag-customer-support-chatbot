@@ -6,6 +6,13 @@ from datetime import datetime, timezone
 sys.path.append(os.path.dirname(__file__))
 from src.backend import get_response, load_knowledge_base
 
+from src.database import init_db, log_interaction
+
+# and call init_db() right after kb_loaded check:
+if "db_initialized" not in st.session_state:
+    init_db()
+    st.session_state.db_initialized = True
+
 # ── Page config ───────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ShopEase Support",
@@ -170,6 +177,15 @@ with col_chat:
             "intent":           result["intent"],
             "timestamp":        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         })
+        log_interaction(
+            timestamp        = st.session_state.chat_log[-1]["timestamp"],
+            query_text       = user_input,
+            response_text    = result["response"],
+            source           = result["source"],
+            category         = result["category"],
+            intent           = result["intent"],
+            confidence_score = result["confidence_score"]
+        )
         st.rerun()
 
 with col_sidebar:
