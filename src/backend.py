@@ -1,178 +1,355 @@
-import chromadb
-from openai import OpenAI
+import os
+import networkx as nx
 import pandas as pd
+from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnableLambda, RunnableSequence
 
-# ── Ollama client ─────────────────────────────────────────────────────
-client = OpenAI(
-    base_url="http://localhost:11434/v1",
-    api_key="ollama"
+# ── Models ────────────────────────────────────────────────────────────
+EMBEDDING_MODEL      = "qwen3-embedding:8b"
+CHAT_MODEL           = "qwen3:8b"
+SIMILARITY_THRESHOLD = 0.70
+TOP_K                = 10
+MAX_MEMORY_MESSAGES  = 6
+
+# ── LangChain Ollama setup ────────────────────────────────────────────
+llm = OllamaLLM(
+    model=CHAT_MODEL,
+    temperature=0.5
 )
 
-EMBEDDING_MODEL = "nomic-embed-text"
-CHAT_MODEL      = "llama3"
-SIMILARITY_THRESHOLD = 0.75
-
-# ── ChromaDB setup ────────────────────────────────────────────────────
-chroma_client     = chromadb.PersistentClient(path="data/chroma_db")
-collection        = chroma_client.get_or_create_collection(
-    name="knowledge_base",
-    metadata={"hnsw:space": "cosine"}
+embeddings = OllamaEmbeddings(
+    model=EMBEDDING_MODEL
 )
+
+# ── Simple conversation memory ────────────────────────────────────────
+conversation_memory = []
+
+# ── ChromaDB via LangChain ────────────────────────────────────────────
+vectorstore = None
 
 def load_knowledge_base():
-    """Embed and store knowledge base into ChromaDB if not already done."""
-    if collection.count() > 0:
-        print(f"ChromaDB already has {collection.count()} documents, skipping embedding.")
+    global vectorstore
+
+    if os.path.exists("data/chroma_db") and len(os.listdir("data/chroma_db")) > 0:
+        print("Loading existing ChromaDB...")
+        vectorstore = Chroma(
+            persist_directory="data/chroma_db",
+            embedding_function=embeddings,
+            collection_name="knowledge_base"
+        )
+        print(f"Loaded {vectorstore._collection.count()} documents.")
         return
 
     print("Embedding knowledge base into ChromaDB...")
     df = pd.read_csv("data/knowledge_base.csv")
 
-    # Embed all documents in one call
-    texts = df["query_text"].tolist()
-    response = client.embeddings.create(
-        input=texts,
-        model=EMBEDDING_MODEL
+    docs = [
+        Document(
+            page_content=row["response_text"],
+            metadata={
+                "query_text":  row["query_text"],
+                "category":    row["category"],
+                "intent":      row["intent"],
+                "document_id": str(row["document_id"])
+            }
+        )
+        for _, row in df.iterrows()
+    ]
+
+    # Embed in batches
+    batch_size = 50
+    all_docs   = []
+    for i in range(0, len(docs), batch_size):
+        batch = docs[i:i+batch_size]
+        all_docs.extend(batch)
+        print(f"Prepared {min(i+batch_size, len(docs))}/{len(docs)} documents...")
+
+    vectorstore = Chroma.from_documents(
+        documents         = all_docs,
+        embedding         = embeddings,
+        persist_directory = "data/chroma_db",
+        collection_name   = "knowledge_base"
     )
-    embeddings = [e.embedding for e in response.data]
+    print(f"Stored {vectorstore._collection.count()} documents in ChromaDB.")
 
-    # Store in ChromaDB
-    collection.add(
-        ids=[str(row["document_id"]) for _, row in df.iterrows()],
-        embeddings=embeddings,
-        documents=df["response_text"].tolist(),
-        metadatas=[
-            {"category": row["category"], "intent": row["intent"]}
-            for _, row in df.iterrows()
-        ]
-    )
-    print(f"Stored {collection.count()} documents in ChromaDB.")
 
-def search_knowledge_base(query_text):
-    """Search ChromaDB for the most relevant response."""
-    # Embed the query
-    response = client.embeddings.create(
-        input=[query_text],
-        model=EMBEDDING_MODEL
-    )
-    query_embedding = response.data[0].embedding
+# ── GraphRAG: Build knowledge graph ──────────────────────────────────
+def build_knowledge_graph():
+    """Build a graph where categories and intents are nodes with relationships."""
+    G = nx.DiGraph()
 
-    # Search ChromaDB for top 3 results
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=3
-    )
-
-    top_response   = results["documents"][0][0]
-    top_distance   = results["distances"][0][0]
-    top_metadata   = results["metadatas"][0][0]
-
-    # ChromaDB cosine distance is 0-2, convert to similarity 0-1
-    confidence_score = round(1 - (top_distance / 2), 4)
-
-    return {
-        "response":         top_response,
-        "confidence_score": confidence_score,
-        "category":         top_metadata["category"],
-        "intent":           top_metadata["intent"],
-        "source":           "knowledge_base" if confidence_score >= SIMILARITY_THRESHOLD else "llm"
+    category_intent_map = {
+        "ACCOUNT":      ["create_account","delete_account","edit_account","switch_account","recover_password","registration_problems"],
+        "ORDER":        ["cancel_order","change_order","place_order","track_order"],
+        "REFUND":       ["check_refund_policy","get_refund","track_refund"],
+        "CONTACT":      ["contact_customer_service","contact_human_agent"],
+        "INVOICE":      ["check_invoice","get_invoice"],
+        "PAYMENT":      ["check_payment_methods","payment_issue"],
+        "FEEDBACK":     ["complaint","review"],
+        "DELIVERY":     ["delivery_options","delivery_period"],
+        "SHIPPING":     ["change_shipping_address","set_up_shipping_address"],
+        "SUBSCRIPTION": ["newsletter_subscription"],
+        "CANCEL":       ["check_cancellation_fee"],
     }
 
-def generate_llm_response(query_text, conversation_history):
-    messages = [
-        {
-            "role": "system",
-            "content": """You are Alex, a friendly and professional customer support agent for ShopEase, 
-an e-commerce platform. 
+    for category, intents in category_intent_map.items():
+        G.add_node(category, type="category")
+        for intent in intents:
+            G.add_node(intent, type="intent")
+            G.add_edge(category, intent, relation="contains")
 
-Your personality:
-- Warm, concise, and helpful
-- Always address the customer's specific problem directly
-- Never give generic answers — always relate to what the customer said
-- If the customer's message is vague, ask ONE clarifying question
-- Keep responses under 3 sentences when possible
-- Never repeat yourself
-
-ShopEase details:
-- Website: www.shopease.com
-- Support email: support@shopease.com  
-- Phone: +1-800-555-0199
-- Support hours: 9 AM to 6 PM EST, Monday to Friday
-- Return window: 30 days with receipt
-- Order cancellation: only before shipment
-
-Always read the conversation history and respond in context."""
-        }
+    cross_relations = [
+        ("ORDER",   "REFUND",   "may_lead_to"),
+        ("ORDER",   "CANCEL",   "may_lead_to"),
+        ("ORDER",   "DELIVERY", "related_to"),
+        ("ORDER",   "SHIPPING", "related_to"),
+        ("PAYMENT", "REFUND",   "related_to"),
+        ("PAYMENT", "INVOICE",  "related_to"),
+        ("ACCOUNT", "CONTACT",  "related_to"),
+        ("REFUND",  "CONTACT",  "related_to"),
     ]
-    messages += conversation_history
-    messages.append({"role": "user", "content": query_text})
+    for src, dst, rel in cross_relations:
+        G.add_edge(src, dst, relation=rel)
 
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=messages,
-        temperature=0.5  # lower = more focused and consistent
-    )
-    return response.choices[0].message.content
+    return G
+
+knowledge_graph = build_knowledge_graph()
+
+def get_related_categories(category):
+    """Use graph to find related categories for broader search."""
+    related = set()
+    if category in knowledge_graph:
+        for neighbor in knowledge_graph.neighbors(category):
+            if knowledge_graph.nodes[neighbor].get("type") == "category":
+                related.add(neighbor)
+        for predecessor in knowledge_graph.predecessors(category):
+            if knowledge_graph.nodes[predecessor].get("type") == "category":
+                related.add(predecessor)
+    return list(related)
 
 
-def get_response(query_text, conversation_history):
-    result = search_knowledge_base(query_text)
+# ── Pipeline Steps ────────────────────────────────────────────────────
 
-    if result["source"] == "knowledge_base":
-        # Instead of returning raw KB response, use it as context for LLM
-        # This makes responses feel natural and context-aware
-        messages = [
-            {
-                "role": "system",
-                "content": """You are Gasminix, a friendly customer support agent for ShopEase.
-Use the provided reference answer as a base, but adapt it to directly address 
-the customer's specific message. Be concise and natural. Max 3 sentences.
+def rewrite_query(inputs):
+    """Step 1: Rewrite query for better search."""
+    query   = inputs["query"]
+    history = inputs.get("history", "")
 
-ShopEase details:
-- Website: www.shopease.com
-- Support email: support@shopease.com
-- Phone: +1-800-555-0199
-- Support hours: 9 AM to 6 PM EST, Monday to Friday"""
-            }
-        ]
-        messages += conversation_history
-        messages.append({
-            "role": "user",
-            "content": f"Customer asked: {query_text}\n\nReference answer: {result['response']}\n\nNow respond naturally and concisely to the customer."
-        })
+    prompt = f"""Rewrite this customer support query to be clear and specific.
+Remove pronouns, make it self-contained.
 
-        response = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            temperature=0.5
-        )
-        retrieved_response = response.choices[0].message.content
+Conversation so far: {history if history else 'None'}
+Query: {query}
+
+Rewritten query (return ONLY the rewritten query, no explanation):"""
+
+    rewritten = llm.invoke(prompt).strip()
+    # Safety: if model returns something too long, fall back to original
+    if len(rewritten) > 300:
+        rewritten = query
+    print(f"[Rewriter] '{query}' → '{rewritten}'")
+    return {**inputs, "rewritten_query": rewritten}
+
+
+def detect_intent(inputs):
+    """Step 2: Classify intent using LLM."""
+    query = inputs["rewritten_query"]
+
+    prompt = f"""Classify this customer support query into ONE category:
+ACCOUNT, ORDER, REFUND, CONTACT, INVOICE, PAYMENT, FEEDBACK, DELIVERY, SHIPPING, SUBSCRIPTION, CANCEL, UNKNOWN
+
+Query: {query}
+Return ONLY the category name, nothing else:"""
+
+    category = llm.invoke(prompt).strip().upper()
+    valid    = {"ACCOUNT","ORDER","REFUND","CONTACT","INVOICE","PAYMENT",
+                "FEEDBACK","DELIVERY","SHIPPING","SUBSCRIPTION","CANCEL","UNKNOWN"}
+
+    # Extract valid category if model returned extra text
+    for word in category.split():
+        if word in valid:
+            category = word
+            break
     else:
-        retrieved_response = generate_llm_response(query_text, conversation_history)
-        result["category"] = "UNKNOWN"
-        result["intent"]   = "unknown"
+        category = "UNKNOWN"
 
-    result["response"] = retrieved_response
+    related = get_related_categories(category)
+    print(f"[Intent] Category: {category} | Related: {related}")
+    return {**inputs, "category": category, "related_categories": related}
 
+
+def search_and_rerank(inputs):
+    """Step 3: RAG search + GraphRAG expansion + reranking."""
+    global vectorstore
+    query    = inputs["rewritten_query"]
+    category = inputs["category"]
+    related  = inputs["related_categories"]
+
+    # Primary RAG search
+    results = vectorstore.similarity_search_with_score(query, k=TOP_K)
+
+    # GraphRAG: boost results from related categories
+    boosted = []
+    for doc, score in results:
+        doc_category = doc.metadata.get("category", "")
+        similarity   = 1 - (score / 2)
+
+        if doc_category == category:
+            similarity = min(1.0, similarity * 1.15)  # 15% boost
+        elif doc_category in related:
+            similarity = min(1.0, similarity * 1.05)  # 5% boost
+
+        boosted.append((doc, similarity))
+
+    boosted.sort(key=lambda x: x[1], reverse=True)
+    top_candidates = boosted[:5]
+    best_score     = top_candidates[0][1]
+
+    if best_score < SIMILARITY_THRESHOLD:
+        print(f"[Search] No good match (best: {best_score:.4f}), using LLM fallback")
+        return {
+            **inputs,
+            "retrieved_response": None,
+            "confidence_score":   round(best_score, 4),
+            "source":             "llm",
+            "intent":             "unknown"
+        }
+
+    # LLM Reranking
+    candidates_text = "\n".join(
+        [f"{i+1}. {doc.page_content}" for i, (doc, _) in enumerate(top_candidates)]
+    )
+    rerank_prompt = f"""You are a reranker for a customer support system.
+Pick the BEST response for this customer query.
+
+Query: {query}
+
+Candidates:
+{candidates_text}
+
+Return ONLY the number (1-5) of the best response, nothing else:"""
+
+    try:
+        rerank_result = llm.invoke(rerank_prompt).strip()
+        # Extract first digit found
+        best_idx = int(next(c for c in rerank_result if c.isdigit())) - 1
+        best_idx = max(0, min(best_idx, 4))
+    except (ValueError, StopIteration):
+        best_idx = 0
+
+    best_doc, best_score = top_candidates[best_idx]
+    print(f"[Reranker] Selected #{best_idx+1} | Score: {best_score:.4f} | Intent: {best_doc.metadata.get('intent')}")
+
+    return {
+        **inputs,
+        "retrieved_response": best_doc.page_content,
+        "confidence_score":   round(best_score, 4),
+        "source":             "knowledge_base",
+        "intent":             best_doc.metadata.get("intent", "unknown")
+    }
+
+
+def generate_response(inputs):
+    """Step 4: Generate final natural response."""
+    query    = inputs["query"]
+    source   = inputs["source"]
+    history  = inputs.get("history", "")
+    category = inputs["category"]
+
+    if source == "knowledge_base":
+        reference = inputs["retrieved_response"]
+        prompt = f"""You are Alex, a friendly customer support agent for ShopEase (e-commerce).
+
+Conversation history: {history if history else 'None'}
+
+Reference answer: {reference}
+
+Customer asked: {query}
+
+Respond naturally and concisely in max 3 sentences.
+Address the customer directly. Do not repeat the reference word for word:"""
+    else:
+        prompt = f"""You are Alex, a friendly customer support agent for ShopEase (e-commerce).
+
+ShopEase info:
+- Website: www.shopease.com
+- Email: support@shopease.com
+- Phone: +1-800-555-0199
+- Hours: 9AM-6PM EST Mon-Fri
+- Returns: 30 days with receipt
+- Cancellations: only before shipment
+
+Conversation history: {history if history else 'None'}
+
+Customer asked: {query}
+
+Respond warmly and concisely. If unrelated to shopping/support, politely say so.
+Max 3 sentences:"""
+
+    response = llm.invoke(prompt).strip()
+    print(f"[Generator] Source: {source} | Category: {category}")
+
+    return {**inputs, "final_response": response}
+
+
+# ── LangChain Pipeline ────────────────────────────────────────────────
+pipeline = RunnableSequence(
+    RunnableLambda(rewrite_query),
+    RunnableLambda(detect_intent),
+    RunnableLambda(search_and_rerank),
+    RunnableLambda(generate_response)
+)
+
+
+# ── Main entry point ──────────────────────────────────────────────────
+def get_response(query_text, conversation_history):
+    """Run the full pipeline and return structured result."""
+    global conversation_memory
+
+    # Build history string from last N messages
+    history_str = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in conversation_memory[-MAX_MEMORY_MESSAGES:]
+    )
+
+    # Run pipeline
+    result = pipeline.invoke({
+        "query":   query_text,
+        "history": history_str
+    })
+
+    # Save to memory
+    conversation_memory.append({"role": "user",      "content": query_text})
+    conversation_memory.append({"role": "assistant",  "content": result["final_response"]})
+
+    # Update conversation history for app.py compatibility
     conversation_history.append({"role": "user",      "content": query_text})
-    conversation_history.append({"role": "assistant",  "content": retrieved_response})
+    conversation_history.append({"role": "assistant",  "content": result["final_response"]})
 
-    return result
+    return {
+        "response":         result["final_response"],
+        "confidence_score": result["confidence_score"],
+        "source":           result["source"],
+        "category":         result["category"],
+        "intent":           result["intent"]
+    }
+
 
 if __name__ == "__main__":
     load_knowledge_base()
 
-    # Quick test
     history = []
     test_queries = [
-        "How do I cancel my order?",                      # should match knowledge base
-        "When can I talk to someone from support?",       # paraphrased - semantic match
-        "What is your return policy for damaged items?"   # might trigger LLM fallback
+        "How do I cancel my order?",
+        "When can I talk to someone from support?",
+        "What is your return policy for damaged items?"
     ]
 
     for query in test_queries:
-        print(f"\nQ: {query}")
+        print(f"\n{'='*50}")
+        print(f"Q: {query}")
         result = get_response(query, history)
         print(f"A: {result['response']}")
-        print(f"Source: {result['source']} | Confidence: {result['confidence_score']} | Category: {result['category']}")
-
+        print(f"Source: {result['source']} | Confidence: {result['confidence_score']} | Category: {result['category']} | Intent: {result['intent']}")
