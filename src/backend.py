@@ -79,14 +79,29 @@ def search_knowledge_base(query_text):
     }
 
 def generate_llm_response(query_text, conversation_history):
-    """Generate a response using Ollama when no good match is found."""
     messages = [
         {
             "role": "system",
-            "content": (
-                "You are a helpful customer support assistant for ShopEase, "
-                "an e-commerce company. Answer clearly and concisely."
-            )
+            "content": """You are Alex, a friendly and professional customer support agent for ShopEase, 
+an e-commerce platform. 
+
+Your personality:
+- Warm, concise, and helpful
+- Always address the customer's specific problem directly
+- Never give generic answers — always relate to what the customer said
+- If the customer's message is vague, ask ONE clarifying question
+- Keep responses under 3 sentences when possible
+- Never repeat yourself
+
+ShopEase details:
+- Website: www.shopease.com
+- Support email: support@shopease.com  
+- Phone: +1-800-555-0199
+- Support hours: 9 AM to 6 PM EST, Monday to Friday
+- Return window: 30 days with receipt
+- Order cancellation: only before shipment
+
+Always read the conversation history and respond in context."""
         }
     ]
     messages += conversation_history
@@ -95,26 +110,50 @@ def generate_llm_response(query_text, conversation_history):
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
-        temperature=0.7
+        temperature=0.5  # lower = more focused and consistent
     )
     return response.choices[0].message.content
 
+
 def get_response(query_text, conversation_history):
-    """Main function: search knowledge base, fall back to LLM if needed."""
     result = search_knowledge_base(query_text)
 
     if result["source"] == "knowledge_base":
-        # Good match found in ChromaDB
-        retrieved_response = result["response"]
+        # Instead of returning raw KB response, use it as context for LLM
+        # This makes responses feel natural and context-aware
+        messages = [
+            {
+                "role": "system",
+                "content": """You are Gasminix, a friendly customer support agent for ShopEase.
+Use the provided reference answer as a base, but adapt it to directly address 
+the customer's specific message. Be concise and natural. Max 3 sentences.
+
+ShopEase details:
+- Website: www.shopease.com
+- Support email: support@shopease.com
+- Phone: +1-800-555-0199
+- Support hours: 9 AM to 6 PM EST, Monday to Friday"""
+            }
+        ]
+        messages += conversation_history
+        messages.append({
+            "role": "user",
+            "content": f"Customer asked: {query_text}\n\nReference answer: {result['response']}\n\nNow respond naturally and concisely to the customer."
+        })
+
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.5
+        )
+        retrieved_response = response.choices[0].message.content
     else:
-        # No good match — generate with LLM
         retrieved_response = generate_llm_response(query_text, conversation_history)
         result["category"] = "UNKNOWN"
         result["intent"]   = "unknown"
 
     result["response"] = retrieved_response
 
-    # Update conversation history
     conversation_history.append({"role": "user",      "content": query_text})
     conversation_history.append({"role": "assistant",  "content": retrieved_response})
 
