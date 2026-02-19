@@ -2,7 +2,7 @@ import os
 import networkx as nx
 import pandas as pd
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda, RunnableSequence
 
@@ -58,7 +58,6 @@ def load_knowledge_base():
         for _, row in df.iterrows()
     ]
 
-    # Embed in batches
     batch_size = 50
     all_docs   = []
     for i in range(0, len(docs), batch_size):
@@ -77,7 +76,6 @@ def load_knowledge_base():
 
 # ── GraphRAG: Build knowledge graph ──────────────────────────────────
 def build_knowledge_graph():
-    """Build a graph where categories and intents are nodes with relationships."""
     G = nx.DiGraph()
 
     category_intent_map = {
@@ -117,17 +115,60 @@ def build_knowledge_graph():
 
 knowledge_graph = build_knowledge_graph()
 
-def get_related_categories(category):
-    """Use graph to find related categories for broader search."""
-    related = set()
-    if category in knowledge_graph:
-        for neighbor in knowledge_graph.neighbors(category):
-            if knowledge_graph.nodes[neighbor].get("type") == "category":
-                related.add(neighbor)
-        for predecessor in knowledge_graph.predecessors(category):
-            if knowledge_graph.nodes[predecessor].get("type") == "category":
-                related.add(predecessor)
+def get_related_categories(category, hops=2):
+    """Multi-hop graph traversal — follow edges up to N levels deep."""
+    related  = set()
+    visited  = {category}
+    frontier = {category}
+
+    for hop in range(hops):
+        next_frontier = set()
+        for node in frontier:
+            if node not in knowledge_graph:
+                continue
+            for neighbor in knowledge_graph.neighbors(node):
+                if knowledge_graph.nodes[neighbor].get("type") == "category":
+                    if neighbor not in visited:
+                        related.add(neighbor)
+                        next_frontier.add(neighbor)
+                        visited.add(neighbor)
+            for predecessor in knowledge_graph.predecessors(node):
+                if knowledge_graph.nodes[predecessor].get("type") == "category":
+                    if predecessor not in visited:
+                        related.add(predecessor)
+                        next_frontier.add(predecessor)
+                        visited.add(predecessor)
+
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    print(f"[GraphRAG] {hops}-hop traversal from '{category}' → {related}")
     return list(related)
+
+
+# ── Fast path detector ────────────────────────────────────────────────
+SIMPLE_PATTERNS = {
+    "hi", "hello", "hey", "good morning", "good evening", "good afternoon",
+    "thanks", "thank you", "bye", "goodbye", "ok", "okay", "sure",
+    "great", "nice", "cool", "alright", "got it", "perfect", "awesome"
+}
+
+def is_simple_message(text):
+    """Detect greetings and simple messages that don't need full pipeline."""
+    cleaned = text.lower().strip().rstrip("!.,?")
+    return cleaned in SIMPLE_PATTERNS or len(cleaned.split()) <= 2
+
+def handle_simple_message(query_text, history_str):
+    """Handle simple messages with a single LLM call."""
+    prompt = f"""You are Alex, a friendly customer support agent for ShopEase.
+Respond briefly and warmly to this greeting or simple message.
+Max 1-2 sentences.
+
+Conversation history: {history_str if history_str else 'None'}
+Message: {query_text}"""
+
+    return llm.invoke(prompt).strip()
 
 
 # ── Pipeline Steps ────────────────────────────────────────────────────
@@ -146,7 +187,6 @@ Query: {query}
 Rewritten query (return ONLY the rewritten query, no explanation):"""
 
     rewritten = llm.invoke(prompt).strip()
-    # Safety: if model returns something too long, fall back to original
     if len(rewritten) > 300:
         rewritten = query
     print(f"[Rewriter] '{query}' → '{rewritten}'")
@@ -154,43 +194,62 @@ Rewritten query (return ONLY the rewritten query, no explanation):"""
 
 
 def detect_intent(inputs):
-    """Step 2: Classify intent using LLM."""
+    """Step 2: Keyword-based intent detection with LLM fallback."""
     query = inputs["rewritten_query"]
 
-    prompt = f"""Classify this customer support query into ONE category:
-ACCOUNT, ORDER, REFUND, CONTACT, INVOICE, PAYMENT, FEEDBACK, DELIVERY, SHIPPING, SUBSCRIPTION, CANCEL, UNKNOWN
+    # Keyword matching first — fast, no LLM needed
+    keyword_map = {
+        "ACCOUNT":      ["account","login","password","register","sign up","signup","profile","delete account","log in"],
+        "ORDER":        ["order","purchase","bought","buy","placed","my order"],
+        "REFUND":       ["refund","money back","reimbursement","return money","damaged","broken","defective","return"],
+        "CONTACT":      ["contact","support","agent","human","talk","speak","call","chat","reach"],
+        "INVOICE":      ["invoice","receipt","bill","billing"],
+        "PAYMENT":      ["payment","pay","charge","credit card","transaction","method"],
+        "FEEDBACK":     ["complaint","review","feedback","unhappy","disappointed","complain"],
+        "DELIVERY":     ["delivery","deliver","shipping time","arrive","arrival","when will"],
+        "SHIPPING":     ["shipping","address","ship to","send to","change address"],
+        "SUBSCRIPTION": ["subscription","newsletter","subscribe","unsubscribe"],
+        "CANCEL":       ["cancel","cancellation","cancelling"],
+    }
 
+    query_lower = query.lower()
+    for category, keywords in keyword_map.items():
+        if any(kw in query_lower for kw in keywords):
+            related = get_related_categories(category)
+            print(f"[Intent] Category: {category} (keyword) | Related: {related}")
+            return {**inputs, "category": category, "related_categories": related}
+
+    # LLM fallback only if no keyword matched
+    try:
+        prompt = f"""Classify into ONE: ACCOUNT, ORDER, REFUND, CONTACT, INVOICE, PAYMENT, FEEDBACK, DELIVERY, SHIPPING, SUBSCRIPTION, CANCEL, UNKNOWN
 Query: {query}
-Return ONLY the category name, nothing else:"""
-
-    category = llm.invoke(prompt).strip().upper()
-    valid    = {"ACCOUNT","ORDER","REFUND","CONTACT","INVOICE","PAYMENT",
-                "FEEDBACK","DELIVERY","SHIPPING","SUBSCRIPTION","CANCEL","UNKNOWN"}
-
-    # Extract valid category if model returned extra text
-    for word in category.split():
-        if word in valid:
-            category = word
-            break
-    else:
+Return ONLY the category name:"""
+        category = llm.invoke(prompt).strip().upper()
+        valid = {"ACCOUNT","ORDER","REFUND","CONTACT","INVOICE","PAYMENT",
+                 "FEEDBACK","DELIVERY","SHIPPING","SUBSCRIPTION","CANCEL","UNKNOWN"}
+        for word in category.split():
+            if word in valid:
+                category = word
+                break
+        else:
+            category = "UNKNOWN"
+    except Exception:
         category = "UNKNOWN"
 
     related = get_related_categories(category)
-    print(f"[Intent] Category: {category} | Related: {related}")
+    print(f"[Intent] Category: {category} (LLM) | Related: {related}")
     return {**inputs, "category": category, "related_categories": related}
 
 
 def search_and_rerank(inputs):
-    """Step 3: RAG search + GraphRAG expansion + reranking."""
+    """Step 3: RAG search + GraphRAG boosting + score-based reranking."""
     global vectorstore
     query    = inputs["rewritten_query"]
     category = inputs["category"]
     related  = inputs["related_categories"]
 
-    # Primary RAG search
     results = vectorstore.similarity_search_with_score(query, k=TOP_K)
 
-    # GraphRAG: boost results from related categories
     boosted = []
     for doc, score in results:
         doc_category = doc.metadata.get("category", "")
@@ -204,8 +263,7 @@ def search_and_rerank(inputs):
         boosted.append((doc, similarity))
 
     boosted.sort(key=lambda x: x[1], reverse=True)
-    top_candidates = boosted[:5]
-    best_score     = top_candidates[0][1]
+    best_doc, best_score = boosted[0]
 
     if best_score < SIMILARITY_THRESHOLD:
         print(f"[Search] No good match (best: {best_score:.4f}), using LLM fallback")
@@ -217,30 +275,7 @@ def search_and_rerank(inputs):
             "intent":             "unknown"
         }
 
-    # LLM Reranking
-    candidates_text = "\n".join(
-        [f"{i+1}. {doc.page_content}" for i, (doc, _) in enumerate(top_candidates)]
-    )
-    rerank_prompt = f"""You are a reranker for a customer support system.
-Pick the BEST response for this customer query.
-
-Query: {query}
-
-Candidates:
-{candidates_text}
-
-Return ONLY the number (1-5) of the best response, nothing else:"""
-
-    try:
-        rerank_result = llm.invoke(rerank_prompt).strip()
-        # Extract first digit found
-        best_idx = int(next(c for c in rerank_result if c.isdigit())) - 1
-        best_idx = max(0, min(best_idx, 4))
-    except (ValueError, StopIteration):
-        best_idx = 0
-
-    best_doc, best_score = top_candidates[best_idx]
-    print(f"[Reranker] Selected #{best_idx+1} | Score: {best_score:.4f} | Intent: {best_doc.metadata.get('intent')}")
+    print(f"[Search] Best match | Score: {best_score:.4f} | Intent: {best_doc.metadata.get('intent')}")
 
     return {
         **inputs,
@@ -290,7 +325,6 @@ Max 3 sentences:"""
 
     response = llm.invoke(prompt).strip()
     print(f"[Generator] Source: {source} | Category: {category}")
-
     return {**inputs, "final_response": response}
 
 
@@ -308,23 +342,37 @@ def get_response(query_text, conversation_history):
     """Run the full pipeline and return structured result."""
     global conversation_memory
 
-    # Build history string from last N messages
     history_str = "\n".join(
         f"{m['role'].capitalize()}: {m['content']}"
         for m in conversation_memory[-MAX_MEMORY_MESSAGES:]
     )
 
-    # Run pipeline
+    # ── Fast path for greetings and simple messages ───────────────────
+    if is_simple_message(query_text):
+        print(f"[FastPath] Simple message: '{query_text}'")
+        response = handle_simple_message(query_text, history_str)
+
+        conversation_memory.append({"role": "user",      "content": query_text})
+        conversation_memory.append({"role": "assistant",  "content": response})
+        conversation_history.append({"role": "user",      "content": query_text})
+        conversation_history.append({"role": "assistant",  "content": response})
+
+        return {
+            "response":         response,
+            "confidence_score": 1.0,
+            "source":           "llm",
+            "category":         "GREETING",
+            "intent":           "greeting"
+        }
+
+    # ── Full pipeline for real queries ────────────────────────────────
     result = pipeline.invoke({
         "query":   query_text,
         "history": history_str
     })
 
-    # Save to memory
     conversation_memory.append({"role": "user",      "content": query_text})
     conversation_memory.append({"role": "assistant",  "content": result["final_response"]})
-
-    # Update conversation history for app.py compatibility
     conversation_history.append({"role": "user",      "content": query_text})
     conversation_history.append({"role": "assistant",  "content": result["final_response"]})
 
@@ -342,6 +390,7 @@ if __name__ == "__main__":
 
     history = []
     test_queries = [
+        "Hi",
         "How do I cancel my order?",
         "When can I talk to someone from support?",
         "What is your return policy for damaged items?"
