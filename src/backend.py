@@ -1,27 +1,46 @@
 import os
 import networkx as nx
 import pandas as pd
-from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from dotenv import load_dotenv
+from openai import OpenAI
+from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda, RunnableSequence
 
+load_dotenv()
+
 # ── Models ────────────────────────────────────────────────────────────
 EMBEDDING_MODEL      = "qwen3-embedding:8b"
-CHAT_MODEL           = "qwen3:8b"
+CHAT_MODEL           = os.getenv("CHAT_MODEL", "gpt-4.1-mini")
 SIMILARITY_THRESHOLD = 0.70
 TOP_K                = 10
 MAX_MEMORY_MESSAGES  = 6
 
-# ── LangChain Ollama setup ────────────────────────────────────────────
-llm = OllamaLLM(
-    model=CHAT_MODEL,
-    temperature=0.5
+# ── Groq AI Gateway client ──────────────────────────────────────────
+client = OpenAI(
+    base_url=os.getenv("VERCEL_BASE_URL"),
+    api_key=os.getenv("GROQ_API_KEY")
 )
 
+# ── Embeddings still local via Ollama ────────────────────────────────
 embeddings = OllamaEmbeddings(
     model=EMBEDDING_MODEL
 )
+
+# ── Unified LLM call ─────────────────────────────────────────────────
+def call_llm(prompt, temperature=0.5):
+    """Unified LLM call via Vercel AI Gateway."""
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[LLM Error] {e}")
+        return ""
 
 # ── Simple conversation memory ────────────────────────────────────────
 conversation_memory = []
@@ -168,7 +187,7 @@ Max 1-2 sentences.
 Conversation history: {history_str if history_str else 'None'}
 Message: {query_text}"""
 
-    return llm.invoke(prompt).strip()
+    return call_llm(prompt)
 
 
 # ── Pipeline Steps ────────────────────────────────────────────────────
@@ -186,7 +205,7 @@ Query: {query}
 
 Rewritten query (return ONLY the rewritten query, no explanation):"""
 
-    rewritten = llm.invoke(prompt).strip()
+    rewritten = call_llm(prompt, temperature=0.1)
     if len(rewritten) > 300:
         rewritten = query
     print(f"[Rewriter] '{query}' → '{rewritten}'")
@@ -197,7 +216,6 @@ def detect_intent(inputs):
     """Step 2: Keyword-based intent detection with LLM fallback."""
     query = inputs["rewritten_query"]
 
-    # Keyword matching first — fast, no LLM needed
     keyword_map = {
         "ACCOUNT":      ["account","login","password","register","sign up","signup","profile","delete account","log in"],
         "ORDER":        ["order","purchase","bought","buy","placed","my order"],
@@ -224,7 +242,7 @@ def detect_intent(inputs):
         prompt = f"""Classify into ONE: ACCOUNT, ORDER, REFUND, CONTACT, INVOICE, PAYMENT, FEEDBACK, DELIVERY, SHIPPING, SUBSCRIPTION, CANCEL, UNKNOWN
 Query: {query}
 Return ONLY the category name:"""
-        category = llm.invoke(prompt).strip().upper()
+        category = call_llm(prompt, temperature=0.0).upper()
         valid = {"ACCOUNT","ORDER","REFUND","CONTACT","INVOICE","PAYMENT",
                  "FEEDBACK","DELIVERY","SHIPPING","SUBSCRIPTION","CANCEL","UNKNOWN"}
         for word in category.split():
@@ -256,9 +274,9 @@ def search_and_rerank(inputs):
         similarity   = 1 - (score / 2)
 
         if doc_category == category:
-            similarity = min(1.0, similarity * 1.15)  # 15% boost
+            similarity = min(1.0, similarity * 1.15)
         elif doc_category in related:
-            similarity = min(1.0, similarity * 1.05)  # 5% boost
+            similarity = min(1.0, similarity * 1.05)
 
         boosted.append((doc, similarity))
 
@@ -323,7 +341,7 @@ Customer asked: {query}
 Respond warmly and concisely. If unrelated to shopping/support, politely say so.
 Max 3 sentences:"""
 
-    response = llm.invoke(prompt).strip()
+    response = call_llm(prompt)
     print(f"[Generator] Source: {source} | Category: {category}")
     return {**inputs, "final_response": response}
 
@@ -402,3 +420,4 @@ if __name__ == "__main__":
         result = get_response(query, history)
         print(f"A: {result['response']}")
         print(f"Source: {result['source']} | Confidence: {result['confidence_score']} | Category: {result['category']} | Intent: {result['intent']}")
+
