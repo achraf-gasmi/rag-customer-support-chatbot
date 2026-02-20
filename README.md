@@ -7,6 +7,11 @@ A locally-run, privacy-first customer support chatbot built with a hybrid **RAG 
 ## 🎯 Project Overview
 
 This project simulates a production-grade AI customer support system for a fictional e-commerce store called **ShopEase**. It classifies customer queries, retrieves relevant responses from a knowledge base using semantic search, and generates natural conversational replies — all locally.
+---
+
+## 🎬 Demo
+
+[![Watch the demo](https://img.shields.io/badge/Watch-Demo-red?style=for-the-badge&logo=youtube)](https://youtu.be/E479DO3jqTA)
 
 ---
 
